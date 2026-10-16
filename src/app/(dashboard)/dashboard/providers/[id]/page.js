@@ -5,7 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import Image from "next/image";
 import { getProviderIconSrc, markProviderIconMissing } from "@/shared/utils/providerIcon";
-import { Card, Button, Badge, Input, Modal, CardSkeleton, OAuthModal, KiroOAuthWrapper, CursorAuthModal, XiaomiMimoAuthModal, IFlowCookieModal, GitLabAuthModal, Toggle, Select, EditConnectionModal, NoAuthProxyCard, ConfirmModal } from "@/shared/components";
+import { Card, Button, Badge, Input, Modal, CardSkeleton, OAuthModal, KiroOAuthWrapper, CursorAuthModal, ZedAuthModal, XiaomiMimoAuthModal, IFlowCookieModal, GitLabAuthModal, Toggle, Select, EditConnectionModal, NoAuthProxyCard, ConfirmModal } from "@/shared/components";
 import { OAUTH_PROVIDERS, APIKEY_PROVIDERS, FREE_PROVIDERS, FREE_TIER_PROVIDERS, WEB_COOKIE_PROVIDERS, getProviderAlias, isOpenAICompatibleProvider, isAnthropicCompatibleProvider, AI_PROVIDERS } from "@/shared/constants/providers";
 import { getModelsByProviderId, getModelKind } from "@/shared/constants/models";
 import { getThinkingLevels } from "open-sse/providers/thinkingLevels.js";
@@ -57,6 +57,7 @@ export default function ProviderDetailPage() {
   const [selectedConnection, setSelectedConnection] = useState(null);
   const [modelAliases, setModelAliases] = useState({});
   const [customModels, setCustomModels] = useState([]);
+  const [connectionsLimit, setConnectionsLimit] = useState(50);
   const [headerImgError, setHeaderImgError] = useState(false);
   const [modelTestResults, setModelTestResults] = useState({});
   const [modelsTestError, setModelsTestError] = useState("");
@@ -84,7 +85,12 @@ export default function ProviderDetailPage() {
   const [oneByOneSummary, setOneByOneSummary] = useState(null);
   const stopOneByOneRef = useRef(false);
   const [importingQoderModels, setImportingQoderModels] = useState(false);
-  const [importingClineModels, setImportingClineModels] = useState(false);
+  const [importingModels, setImportingModels] = useState(false);
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [customModelsUrl, setCustomModelsUrl] = useState("");
+  const [importPreview, setImportPreview] = useState(null);
+  const [importMode, setImportMode] = useState("all"); // "all" | "free" | "paid"
+  const [modelSort, setModelSort] = useState("free");
   const { copied, copy } = useCopyToClipboard();
 
   const AG_RISK_STORAGE_KEY = "ag_risk_confirmed";
@@ -150,6 +156,7 @@ export default function ProviderDetailPage() {
         type: providerNode.type,
       }
     : (OAUTH_PROVIDERS[providerId] || APIKEY_PROVIDERS[providerId] || FREE_PROVIDERS[providerId] || FREE_TIER_PROVIDERS[providerId] || WEB_COOKIE_PROVIDERS[providerId]);
+  const modelsFetcher = providerInfo?.modelsFetcher;
   const authModes = providerInfo?.authModes || [];
   const isOAuth = !!OAUTH_PROVIDERS[providerId] || !!FREE_PROVIDERS[providerId] || authModes.includes("oauth");
   const supportsApiKeyAuth = !!APIKEY_PROVIDERS[providerId] || authModes.includes("apikey");
@@ -463,10 +470,10 @@ export default function ProviderDetailPage() {
   };
 
   useEffect(() => {
-    fetchConnections();
-    fetchAliases();
-    fetchCustomModels();
-    fetchDisabledModels();
+    queueMicrotask(() => fetchConnections());
+    queueMicrotask(() => fetchAliases());
+    queueMicrotask(() => fetchCustomModels());
+    queueMicrotask(() => fetchDisabledModels());
   }, [fetchConnections, fetchAliases, fetchCustomModels, fetchDisabledModels]);
 
   // Live per-connection catalogs (cursor, zed): the static registry carries
@@ -476,19 +483,19 @@ export default function ProviderDetailPage() {
   useEffect(() => {
     const isLiveCatalog = providerId === "cursor" || providerId === "zed";
     if (!isLiveCatalog) {
-      setLiveModels([]);
+      queueMicrotask(() => setLiveModels([]));
       return;
     }
 
     const connection = connections.find((item) => item.isActive !== false);
     if (!connection?.id) {
-      setLiveModels([]);
-      if (providerId === "zed") setLiveModelsError(null);
+      queueMicrotask(() => setLiveModels([]));
+      if (providerId === "zed") queueMicrotask(() => setLiveModelsError(null));
       return;
     }
 
     let cancelled = false;
-    if (providerId === "zed") setLiveModelsError(null);
+    if (providerId === "zed") queueMicrotask(() => setLiveModelsError(null));
     fetch(`/api/providers/${connection.id}/models`, { cache: "no-store" })
       .then(async (res) => ({ ok: res.ok, data: await res.json().catch(() => null) }))
       .then(({ ok, data }) => {
@@ -515,7 +522,7 @@ export default function ProviderDetailPage() {
 
   // Fetch suggested models from provider's public API (if configured)
   useEffect(() => {
-    const fetcher = (OAUTH_PROVIDERS[providerId] || APIKEY_PROVIDERS[providerId] || FREE_PROVIDERS[providerId] || FREE_TIER_PROVIDERS[providerId])?.modelsFetcher;
+    const fetcher = modelsFetcher;
     if (!fetcher) return;
     fetchSuggestedModels(fetcher).then(setSuggestedModels);
   }, [providerId]);
@@ -552,12 +559,14 @@ export default function ProviderDetailPage() {
     }
   };
 
-  const handleAddCustomModel = async (modelId, type = "llm", providerAliasOverride = providerStorageAlias, caps) => {
+  // `transport` pins a realtime STT dispatch marker (shared whitelist
+  // STT_TRANSPORT_META); the API only honours it on type "stt" records.
+  const handleAddCustomModel = async (modelId, type = "llm", providerAliasOverride = providerStorageAlias, caps, transport) => {
     try {
       const res = await fetch("/api/models/custom", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ providerAlias: providerAliasOverride, id: modelId, type, ...(caps ? { caps } : {}) }),
+        body: JSON.stringify({ providerAlias: providerAliasOverride, id: modelId, type, ...(caps ? { caps } : {}), ...(transport ? { transport } : {}) }),
       });
       if (res.ok) {
         await fetchCustomModels();
@@ -638,53 +647,190 @@ export default function ProviderDetailPage() {
       setImportingQoderModels(false);
     }
   };
-  // Fetch the live Cline /models catalog and add every model not yet present.
-  // Cline and ClinePass share the same catalog endpoint (api.cline.bot/api/v1/models).
-  const handleImportClineModels = async () => {
-    if (importingClineModels) return;
-    const activeConnection = connections.find((conn) => conn.isActive !== false);
-    if (!activeConnection) {
-      alert(translate("Please add an active Cline connection first"));
-      return;
-    }
-    setImportingClineModels(true);
+  // Generic "Get Models": fetch suggested catalog (modelsFetcher) and open the
+  // preview modal so free/paid detection happens before anything is imported.
+  // Same preview flow as "Import from /models" — every import is confirmable.
+  const importModelsFromFetcher = async () => {
+    if (importingModels) return;
+    const fetcher = modelsFetcher;
+    if (!fetcher) return;
+    setImportingModels(true);
     try {
-      const res = await fetch(`/api/providers/${activeConnection.id}/models`);
-      const data = await res.json();
-      if (!res.ok) {
-        alert(data.error || translate("Failed to fetch models"));
-        return;
-      }
-      const models = data.models || [];
-      if (models.length === 0) {
+      const suggested = await fetchSuggestedModels(fetcher);
+      if (!suggested.length) {
         alert(translate("No models returned"));
         return;
       }
-      let importedCount = 0;
-      for (const model of models) {
-        const modelId = model.id || model.name;
-        if (!modelId) continue;
-        const alreadyExists = customModels.some(
-          (entry) => entry.providerAlias === providerStorageAlias && entry.id === modelId && (entry.kind || entry.type || "llm") === "llm"
-        ) || Object.values(modelAliases).includes(`${providerStorageAlias}/${modelId}`);
-        if (alreadyExists) {
-          continue;
-        }
-        await handleAddCustomModel(modelId, "llm", providerStorageAlias);
-        importedCount += 1;
-      }
-      if (importedCount === 0) {
+      // Dedup against already-known models, tag free/paid, open the shared
+      // preview modal — user confirms which slice to import (all / free /
+      // paid) instead of a silent mass import.
+      const existingIds = new Set([
+        ...customModels.filter((entry) => entry.providerAlias === providerStorageAlias).map((entry) => entry.id),
+        ...models.map((m) => m.id),
+      ]);
+      const newModels = suggested
+        .map((m) => {
+          const modelId = m.id || m.name;
+          if (!modelId || existingIds.has(modelId)) return null;
+          return { id: modelId, kind: m.kind || m.type || "llm", isFree: m.isFree === true || String(modelId).endsWith(":free") };
+        })
+        .filter(Boolean);
+      if (!newModels.length) {
         alert(translate("All models already exist, no new models added"));
-      } else {
-        alert(translate("Successfully added") + ` ${importedCount} ` + translate("models"));
+        return;
       }
+      setImportMode("all");
+      setImportPreview({ total: newModels.length, freeCount: newModels.filter((m) => m.isFree).length, models: newModels });
     } catch (error) {
-      console.log("Error importing Cline models:", error);
+      console.log("Error fetching fetcher models:", error);
       alert(translate("Error fetching models") + ": " + error.message);
     } finally {
-      setImportingClineModels(false);
+      setImportingModels(false);
     }
   };
+
+  // "Import from /models": pull the provider's live /models endpoint via the
+  // per-provider API route (handles OpenAI-compatible /models, Anthropic-compatible
+  // /models, and OAuth/custom resolvers). Import models not yet present locally.
+  // For openai-compatible: GET {baseUrl}/models with Bearer.
+  // For anthropic-compatible: GET {baseUrl}/models with x-api-key (gateway must expose it).
+  const importFromModelsEndpoint = async (customUrl = null) => {
+    if (importingModels) return;
+    setImportingModels(true);
+    try {
+      let fetched;
+      if (customUrl && customUrl.trim()) {
+        const res = await fetch(
+          `/api/providers/suggested-models?url=${encodeURIComponent(customUrl.trim())}&type=any`,
+          { cache: "no-store" }
+        );
+        const data = await res.json();
+        fetched = Array.isArray(data.data) ? data.data : [];
+      } else {
+        const activeConnection = connections.find((conn) => conn.isActive !== false);
+        if (!activeConnection) {
+          alert(translate("Please add an active connection first"));
+          return;
+        }
+        const res = await fetch(`/api/providers/${activeConnection.id}/models`, { cache: "no-store" });
+        const data = await res.json();
+        if (!res.ok) {
+          alert((data.error || translate("Failed to fetch models")) + (data.status ? ` (HTTP ${data.status})` : ""));
+          return;
+        }
+        fetched = data.models || [];
+      }
+      if (!fetched.length) {
+        alert(translate("No models returned from /models"));
+        return;
+      }
+      // Dedup against already-known models; tag free for preview + import.
+      const existingIds = new Set([
+        ...customModels.filter((entry) => entry.providerAlias === providerStorageAlias).map((entry) => entry.id),
+        ...models.map((m) => m.id),
+      ]);
+      const newModels = fetched
+        .map((model) => {
+          const modelId = model.id || model.name;
+          if (!modelId || existingIds.has(modelId)) return null;
+          const isFree = String(modelId).endsWith(":free") || model.isFree === true || (model.pricing?.prompt === "0" && model.pricing?.completion === "0");
+          return { id: modelId, kind: model.kind || model.type || "llm", isFree };
+        })
+        .filter(Boolean);
+      if (!newModels.length) {
+        alert(translate("All models already exist, no new models added"));
+        return;
+      }
+      setImportMode("all");
+      setImportPreview({ total: newModels.length, freeCount: newModels.filter((m) => m.isFree).length, models: newModels });
+    } catch (error) {
+      console.log("Error fetching /models:", error);
+      alert(translate("Error fetching models") + ": " + error.message);
+    } finally {
+      setImportingModels(false);
+    }
+  };
+
+  // Confirm import from preview modal — apply the selected import mode.
+  // Used by the universal "Import from /models" button (all providers) and
+  // "Get Models" (providers with a modelsFetcher), so free-model-only
+  // detection is consistent across every provider.
+  const confirmImportFromPreview = async () => {
+    if (!importPreview || importingModels) return;
+    let toImport = importPreview.models;
+    if (importMode === "free") toImport = toImport.filter((m) => m.isFree);
+    else if (importMode === "paid") toImport = toImport.filter((m) => !m.isFree);
+    if (!toImport.length) {
+      alert(`No ${importMode === "paid" ? "paid/unknown" : "free"} models to import with current filter`);
+      setImportPreview(null);
+      return;
+    }
+    setImportingModels(true);
+    setImportPreview(null);
+    try {
+      let importedCount = 0;
+      for (const model of toImport) {
+        await handleAddCustomModel(model.id, model.kind, providerStorageAlias, { isFree: model.isFree });
+        importedCount += 1;
+      }
+      // Persist the active subset to the provider connection so /v1/models
+      // (via the live-catalog resolver) only emits what the user actually
+      // selected — stops Cline from dumping 460 rows when 5 are enabled.
+      const activeConnection = connections.find((c) => c.isActive !== false);
+      if (activeConnection && (providerId === "cline" || providerId === "clinepass")) {
+        const enabledIds = toImport.map((m) => m.id);
+        await fetch(`/api/providers/${activeConnection.id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            providerSpecificData: {
+              ...(activeConnection.providerSpecificData || {}),
+              enabledModels: enabledIds,
+            },
+          }),
+        });
+      }
+      alert(translate("Successfully added") + ` ${importedCount} ` + translate("models"));
+      const freeImported = toImport.filter((m) => m.isFree);
+      if (freeImported.length && connections.some((c) => c.isActive !== false)) {
+        const doCheck = window.confirm(
+          `${freeImported.length} free model(s) imported. Check availability with current account now?`
+        );
+        if (doCheck) checkModelsWithAccount(freeImported);
+      }
+    } catch (error) {
+      alert(translate("Error importing models") + ": " + error.message);
+    } finally {
+      setImportingModels(false);
+    }
+  };
+
+  // Ping free models via internal /api/models/test with current credentials.
+  const checkModelsWithAccount = async (freeModels) => {
+    setImportingModels(true);
+    const results = [];
+    for (const model of freeModels) {
+      try {
+        const res = await fetch("/api/models/test", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: `${providerDisplayAlias}/${model.id}`, kind: model.kind || "llm" }),
+        });
+        const data = await res.json();
+        results.push({ id: model.id, ok: !!data.ok, error: data.error || null });
+      } catch {
+        results.push({ id: model.id, ok: false, error: "network error" });
+      }
+    }
+    setImportingModels(false);
+    const okCount = results.filter((r) => r.ok).length;
+    const failLines = results.filter((r) => !r.ok).slice(0, 20).map((r) => `  x ${r.id} - ${r.error || "error"}`).join("\n");
+    alert(
+      `Account check complete: ${okCount}/${results.length} free models available.\n` +
+      (failLines ? `Unreachable:\n${failLines}` : "All free models reachable.")
+    );
+  };
+
 
   const handleRunOneByOneTest = async () => {
     if (oneByOneRunning || connections.length === 0) return;
@@ -942,7 +1088,7 @@ export default function ProviderDetailPage() {
   };
 
   useEffect(() => {
-    setSelectedConnectionIds((prev) => prev.filter((id) => connections.some((conn) => conn.id === id)));
+    queueMicrotask(() => setSelectedConnectionIds((prev) => prev.filter((id) => connections.some((conn) => conn.id === id))));
   }, [connections]);
 
   const selectedProxySummary = (() => {
@@ -1018,6 +1164,7 @@ export default function ProviderDetailPage() {
   const connectionsList = (
     <div className="flex min-w-0 flex-col divide-y divide-black/[0.03] dark:divide-white/[0.03] max-h-[500px] overflow-y-auto pr-1">
       {connections
+        .slice(0, connectionsLimit)
         .map((conn, index) => (
           <div key={conn.id} className="flex min-w-0 items-stretch">
             <div className="flex shrink-0 items-center pl-1 sm:pl-2">
@@ -1071,6 +1218,25 @@ export default function ProviderDetailPage() {
             </div>
           </div>
         ))}
+      {connections.length > connectionsLimit && (
+        <div className="py-2 text-center border-t border-black/[0.03] dark:border-white/[0.03]">
+          <button
+            type="button"
+            onClick={() => setConnectionsLimit((prev) => prev + 100)}
+            className="text-xs text-primary hover:underline px-3 py-1 font-medium"
+          >
+            Show more ({connections.length - connectionsLimit} remaining)
+          </button>
+          <span className="text-text-muted text-xs mx-1">·</span>
+          <button
+            type="button"
+            onClick={() => setConnectionsLimit(connections.length)}
+            className="text-xs text-text-muted hover:text-text hover:underline px-2 py-1"
+          >
+            Show all ({connections.length})
+          </button>
+        </div>
+      )}
     </div>
   );
 
@@ -1132,7 +1298,7 @@ export default function ProviderDetailPage() {
       const res = await fetch("/api/models/test", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: `${providerStorageAlias}/${modelId}` }),
+        body: JSON.stringify({ model: `${providerDisplayAlias}/${modelId}` }),
       });
       const data = await res.json();
       setModelTestResults((prev) => ({ ...prev, [modelId]: data.ok ? "ok" : "error" }));
@@ -1143,6 +1309,103 @@ export default function ProviderDetailPage() {
     } finally {
       setTestingModelIds((prev) => { const n = new Set(prev); n.delete(modelId); return n; });
     }
+  };
+  const [testingAll, setTestingAll] = useState(false);
+
+  const handleTestAll = async (ids) => {
+    if (testingAll || !ids.length) return;
+    setTestingAll(true);
+    setModelTestResults({});
+    setModelsTestError("");
+    const CONCURRENCY = 6;
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(CONCURRENCY, ids.length) }, async () => {
+      while (true) {
+        const i = cursor++;
+        if (i >= ids.length) return;
+        const modelId = ids[i];
+        setTestingModelIds((prev) => new Set(prev).add(modelId));
+        try {
+          const res = await fetch("/api/models/test", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ model: `${providerDisplayAlias}/${modelId}` }),
+          });
+          const data = await res.json();
+          setModelTestResults((prev) => ({ ...prev, [modelId]: data.ok ? "ok" : "error" }));
+        } catch {
+          setModelTestResults((prev) => ({ ...prev, [modelId]: "error" }));
+        } finally {
+          setTestingModelIds((prev) => { const n = new Set(prev); n.delete(modelId); return n; });
+        }
+      }
+    });
+    await Promise.all(workers);
+    setTestingAll(false);
+    // Settle: if every result is an error and there is at least one, surface a summary error line.
+    setModelTestResults((current) => {
+      const values = Object.values(current);
+      if (values.length > 0 && values.every((v) => v === "error")) {
+        setModelsTestError(`${values.length} of ${values.length} model(s) failed — check connection/credentials or region.`);
+      }
+      return current;
+    });
+  };
+
+  const handleDisableAllFailed = async () => {
+    const failedIds = Object.entries(modelTestResults)
+      .filter(([, s]) => s === "error")
+      .map(([id]) => id);
+    if (failedIds.length === 0) return;
+    setConfirmState({
+      title: "Disable Failed Models",
+      message: `Disable ${failedIds.length} model(s) that failed the test?`,
+      onConfirm: async () => {
+        setConfirmState(null);
+        try {
+          const res = await fetch("/api/models/disabled", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ providerAlias: providerStorageAlias, ids: failedIds }),
+          });
+          if (res.ok) {
+            await fetchDisabledModels();
+            // Clear test results for the now-disabled models.
+            setModelTestResults((prev) => {
+              const n = { ...prev };
+              failedIds.forEach((id) => delete n[id]);
+              return n;
+            });
+          }
+        } catch (error) {
+          console.log("Error disabling failed models:", error);
+        }
+      }
+    });
+  };
+
+  const handleDeleteAllDisabledCustom = (ids) => {
+    if (!ids || ids.length === 0) return;
+    setConfirmState({
+      title: "Delete Disabled Custom Models",
+      message: `Delete ${ids.length} disabled custom model(s) imported via /models? This cannot be undone.`,
+      onConfirm: async () => {
+        setConfirmState(null);
+        setImportingModels(true);
+        try {
+          for (const id of ids) {
+            await handleDeleteCustomModel(id, "llm", providerStorageAlias);
+            await handleEnableModel(id);
+          }
+          await fetchCustomModels();
+          await fetchDisabledModels();
+        } catch (error) {
+          console.log("Error deleting disabled custom models:", error);
+        } finally {
+          setImportingModels(false);
+        }
+      }
+    });
   };
 
   const renderModelsSection = () => {
@@ -1172,19 +1435,39 @@ export default function ProviderDetailPage() {
     ].filter((m) => { const k = getModelKind(m); return !k || k === "llm"; });
     const disabledSet = new Set(disabledModelIds);
     const displayModels = allModels.filter((m) => !disabledSet.has(m.id));
-    const disabledDisplayModels = allModels.filter((m) => disabledSet.has(m.id));
+    // Free/paid sort: free models first (default), paid last, ties alphabetical
+    const sortedModels = [...displayModels].sort((a, b) => {
+      const af = modelSort === "free" ? (a.isFree ? 0 : 1) : 0;
+      const bf = modelSort === "free" ? (b.isFree ? 0 : 1) : 0;
+      if (af !== bf) return af - bf;
+      return String(a.id || a.name).localeCompare(String(b.id || b.name));
+    });
+    const builtInIdSet = new Set(allModels.map((m) => m.id));
+    const disabledBuiltInModels = allModels.filter((m) => disabledSet.has(m.id));
+    const disabledCustomModels = disabledModelIds
+      .filter((id) => !builtInIdSet.has(id))
+      .map((id) => ({ id, isCustom: true }));
     const customModelRows = getProviderCustomModelRows({
       customModels,
       modelAliases,
       providerAlias: providerStorageAlias,
       builtInModels: models,
       type: "llm",
+      disabledModelIds,
     });
+    const sortedCustomRows = modelSort === "free"
+      ? [...customModelRows].sort((a, b) => {
+          const af = a.isFree ? 0 : 1;
+          const bf = b.isFree ? 0 : 1;
+          if (af !== bf) return af - bf;
+          return String(a.id || a.name).localeCompare(String(b.id || b.name));
+        })
+      : customModelRows;
 
     return (
       <div className="flex flex-wrap gap-3">
         {/* Custom models first */}
-        {customModelRows.map((model) => (
+        {sortedCustomRows.map((model) => (
           <ModelRow
             key={`${model.source}-${model.fullModel}`}
             model={{ id: model.id, name: model.name }}
@@ -1203,14 +1486,14 @@ export default function ProviderDetailPage() {
             testStatus={modelTestResults[model.id]}
             onTest={connections.length > 0 || isFreeNoAuth ? () => handleTestModel(model.id) : undefined}
             isTesting={testingModelIds.has(model.id)}
-            isCustom
-            isFree={false}
+            isFree={model.isFree}
+            isCustom={model.source === "custom"}
             caps={getCaps(`${providerId}/${model.id}`)}
             thinkingSuffix={resolveThinkingSuffix(model.id)}
           />
         ))}
 
-        {displayModels.map((model) => {
+        {sortedModels.map((model) => {
           const fullModel = `${providerStorageAlias}/${model.id}`;
           const oldFormatModel = `${providerId}/${model.id}`;
           const existingAlias = Object.entries(modelAliases).find(
@@ -1246,8 +1529,36 @@ export default function ProviderDetailPage() {
           Add Model
         </button>
 
-        {/* Import Qoder models button — only show for qoder/qoder-cn provider */}
-        {(providerId === "qoder" || providerId === "qoder-cn") && connections.some((conn) => conn.isActive !== false) && (
+        {/* Generic "Get Models" — fetch live catalog via modelsFetcher, import all */}
+        {modelsFetcher && (
+          <button
+            onClick={importModelsFromFetcher}
+            disabled={importingModels}
+            className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-emerald-500/40 px-3 py-2 text-xs text-emerald-600 dark:text-emerald-400 transition-colors hover:border-emerald-500 hover:bg-emerald-500/5 sm:w-auto disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Fetch live model catalog and import all models"
+          >
+            <span
+              className="material-symbols-outlined text-sm"
+              style={importingModels ? { animation: "spin 1s linear infinite" } : undefined}
+            >
+              {importingModels ? "progress_activity" : "download"}
+            </span>
+            {importingModels ? translate("Fetching...") : translate("Get Models")}
+          </button>
+        )}
+
+        {/* Free / paid sort toggle */}
+        <button
+          onClick={() => setModelSort(modelSort === "free" ? "all" : "free")}
+          className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-black/10 bg-black/[0.02] px-3 py-2 text-xs text-text-muted transition-colors hover:bg-black/5 dark:border-white/10 dark:bg-white/[0.03] dark:hover:bg-white/10 sm:w-auto"
+          title={modelSort === "free" ? "Free models first" : "All models, alphabetical"}
+        >
+          <span className="material-symbols-outlined text-sm">sort</span>
+          {modelSort === "free" ? "Free first" : "All models"}
+        </button>
+
+        {/* Import Qoder models button — only show for qoder provider */}
+        {providerId === "qoder" && connections.some((conn) => conn.isActive !== false) && (
           <button
             onClick={handleImportQoderModels}
             disabled={importingQoderModels}
@@ -1260,18 +1571,110 @@ export default function ProviderDetailPage() {
           </button>
         )}
 
-        {/* Import Cline /models catalog button — only show for cline and clinepass providers */}
-        {(providerId === "cline" || providerId === "clinepass") && connections.some((conn) => conn.isActive !== false) && (
+        {/* Import from /models — all providers with an active connection.
+            Opens a modal: optional custom URL, then a preview with count + free-only filter. */}
+        {connections.some((conn) => conn.isActive !== false) && (
           <button
-            onClick={handleImportClineModels}
-            disabled={importingClineModels}
+            onClick={() => { setCustomModelsUrl(""); setShowImportModal(true); }}
+            disabled={importingModels}
             className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-blue-500/40 px-3 py-2 text-xs text-blue-600 dark:text-blue-400 transition-colors hover:border-blue-500 hover:bg-blue-500/5 sm:w-auto disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Import models from /models — optionally enter a custom URL"
           >
-            <span className="material-symbols-outlined text-sm" style={importingClineModels ? { animation: "spin 1s linear infinite" } : undefined}>
-              {importingClineModels ? "progress_activity" : "download"}
+            <span
+              className="material-symbols-outlined text-sm"
+              style={importingModels ? { animation: "spin 1s linear infinite" } : undefined}
+            >
+              {importingModels ? "progress_activity" : "download"}
             </span>
-            {importingClineModels ? translate("Fetching...") : translate("Import from /models")}
+            {importingModels ? translate("Fetching...") : translate("Import from /models")}
           </button>
+        )}
+
+        {/* Custom /models URL modal */}
+        <Modal
+          isOpen={showImportModal}
+          onClose={() => setShowImportModal(false)}
+          title="Import from /models"
+        >
+          <div className="flex flex-col gap-3">
+            <p className="text-xs text-text-muted">
+              Leave blank to use this provider&apos;s default /models endpoint.
+              Or enter a full URL to fetch from a specific gateway (e.g.{" "}
+              <code className="text-[11px]">https://api.example.com/v1/models</code>).
+            </p>
+            <Input
+              placeholder="https://api.example.com/v1/models"
+              value={customModelsUrl}
+              onChange={(e) => setCustomModelsUrl(e.target.value)}
+            />
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" onClick={() => setShowImportModal(false)} disabled={importingModels}>
+                Cancel
+              </Button>
+              <Button
+                onClick={() => { setShowImportModal(false); importFromModelsEndpoint(customModelsUrl || null); }}
+                disabled={importingModels}
+              >
+                {importingModels ? "Importing..." : "Import"}
+              </Button>
+            </div>
+          </div>
+        </Modal>
+
+        {/* Import preview: count + mode selector + confirm */}
+        {importPreview && (
+          <Modal
+            isOpen={!!importPreview}
+            onClose={() => setImportPreview(null)}
+            title="Import Preview"
+          >
+            <div className="flex flex-col gap-3">
+              <p className="text-sm">
+                <b>{importPreview.total}</b> new model(s) found.
+                <br />
+                <span className="text-xs text-text-muted">
+                  {importPreview.freeCount} free / {importPreview.total - importPreview.freeCount} paid-or-unknown
+                </span>
+              </p>
+              <div className="flex items-center gap-3 text-xs">
+                <span className="text-text-muted">Import:</span>
+                <label className="flex items-center gap-1.5 cursor-pointer">
+                  <input type="radio" checked={importMode === "all"} onChange={() => setImportMode("all")} className="accent-blue-500" />
+                  All
+                </label>
+                <label className="flex items-center gap-1.5 cursor-pointer">
+                  <input type="radio" checked={importMode === "free"} onChange={() => setImportMode("free")} className="accent-blue-500" />
+                  Free only ({importPreview.freeCount})
+                </label>
+                <label className="flex items-center gap-1.5 cursor-pointer">
+                  <input type="radio" checked={importMode === "paid"} onChange={() => setImportMode("paid")} className="accent-blue-500" />
+                  Paid/unknown ({importPreview.total - importPreview.freeCount})
+                </label>
+              </div>
+              {importPreview.total > 50 && importMode !== "free" && (
+                <p className="text-xs text-amber-600 dark:text-amber-400">
+                  Large import — {importMode === "all" ? "all models" : "paid/unknown"} selected.
+                </p>
+              )}
+              <div className="flex justify-end gap-2">
+                <Button variant="ghost" onClick={() => setImportPreview(null)} disabled={importingModels}>
+                  Cancel
+                </Button>
+                <Button
+                  onClick={confirmImportFromPreview}
+                  disabled={importingModels}
+                >
+                  {importingModels
+                    ? "Importing..."
+                    : importMode === "all"
+                      ? `Import ${importPreview.total} models`
+                      : importMode === "free"
+                        ? `Import ${importPreview.freeCount} free models`
+                        : `Import ${importPreview.total - importPreview.freeCount} models`}
+                </Button>
+              </div>
+            </div>
+          </Modal>
         )}
 
         {/* Suggested models from provider API — show only models not yet added */}
@@ -1307,14 +1710,23 @@ export default function ProviderDetailPage() {
           );
         })()}
 
-        {/* Disabled models — restorable */}
-        {disabledDisplayModels.length > 0 && (
+        {/* Disabled models — restorable, custom ones deletable */}
+        {(disabledBuiltInModels.length > 0 || disabledCustomModels.length > 0) && (
           <div className="w-full mt-2">
-            <p className="text-xs text-text-muted mb-2">Disabled models ({disabledDisplayModels.length}):</p>
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <p className="text-xs text-text-muted">
+                Disabled models ({disabledBuiltInModels.length + disabledCustomModels.length}):
+              </p>
+              {disabledCustomModels.length > 1 && (
+                <Button size="sm" variant="ghost" icon="delete_sweep" onClick={() => handleDeleteAllDisabledCustom(disabledCustomModels.map((m) => m.id))}>
+                  Delete All Disabled ({disabledCustomModels.length})
+                </Button>
+              )}
+            </div>
             <div className="flex flex-wrap gap-2">
-              {disabledDisplayModels.map((m) => (
+              {disabledBuiltInModels.map((m) => (
                 <button
-                  key={m.id}
+                  key={`bi-${m.id}`}
                   onClick={() => handleEnableModel(m.id)}
                   className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-dashed border-black/10 dark:border-white/10 text-xs text-text-muted hover:text-primary hover:border-primary/40 hover:bg-primary/5 transition-colors"
                   title="Restore model"
@@ -1322,6 +1734,30 @@ export default function ProviderDetailPage() {
                   <span className="material-symbols-outlined text-[13px]">add</span>
                   {m.id}
                 </button>
+              ))}
+              {disabledCustomModels.map((m) => (
+                <span key={`custom-${m.id}`} className="flex items-center gap-1">
+                  <button
+                    onClick={() => handleEnableModel(m.id)}
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-dashed border-black/10 dark:border-white/10 text-xs text-text-muted hover:text-primary hover:border-primary/40 hover:bg-primary/5 transition-colors"
+                    title="Restore model"
+                  >
+                    <span className="material-symbols-outlined text-[13px]">add</span>
+                    {m.id}
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (window.confirm(`Delete disabled custom model "${m.id}"? This cannot be undone.`)) {
+                        handleDeleteCustomModel(m.id, "llm", providerStorageAlias);
+                        handleEnableModel(m.id);
+                      }
+                    }}
+                    className="flex items-center gap-1 px-2 py-1.5 rounded-lg border border-dashed border-red-500/30 text-xs text-red-500 hover:border-red-500 hover:bg-red-500/5 transition-colors"
+                    title="Delete this model (deprecated/duplicate)"
+                  >
+                    <span className="material-symbols-outlined text-[13px]">delete</span>
+                  </button>
+                </span>
               ))}
             </div>
           </div>
@@ -1762,10 +2198,19 @@ export default function ProviderDetailPage() {
             )}
           </div>
           {!isCompatible && (() => {
+            const customLlmIds = getProviderCustomModelRows({
+              customModels,
+              modelAliases,
+              providerAlias: providerStorageAlias,
+              builtInModels: models,
+              type: "llm",
+              disabledModelIds,
+            }).map((r) => r.id);
             const allIds = [
               ...models,
               ...kiloFreeModels.filter((fm) => !models.some((m) => m.id === fm.id)),
-            ].filter((m) => { const k = getModelKind(m); return !k || k === "llm"; }).map((m) => m.id);
+            ].filter((m) => { const k = getModelKind(m); return !k || k === "llm"; }).map((m) => m.id)
+              .concat(customLlmIds);
             const activeIds = allIds.filter((id) => !disabledModelIds.includes(id));
             return (
               <div className="flex gap-2">
@@ -1777,6 +2222,16 @@ export default function ProviderDetailPage() {
                 {activeIds.length > 0 && (
                   <Button size="sm" variant="secondary" icon="block" onClick={() => handleDisableAll(activeIds)}>
                     Disable All
+                  </Button>
+                )}
+                {(connections.length > 0 || isFreeNoAuth) && activeIds.length > 0 && (
+                  <Button size="sm" variant="secondary" icon="science" onClick={() => handleTestAll(activeIds)}>
+                    {testingAll ? "Testing…" : "Test All"}
+                  </Button>
+                )}
+                {Object.values(modelTestResults).some((s) => s === "error") && (
+                  <Button size="sm" variant="secondary" icon="filter_off" onClick={handleDisableAllFailed}>
+                    Disable All Failed ({Object.values(modelTestResults).filter((s) => s === "error").length})
                   </Button>
                 )}
               </div>
@@ -1831,6 +2286,13 @@ export default function ProviderDetailPage() {
       ) : providerId === "cursor" ? (
         <CursorAuthModal
           isOpen={showOAuthModal}
+          onSuccess={handleOAuthSuccess}
+          onClose={() => setShowOAuthModal(false)}
+        />
+      ) : providerId === "zed" ? (
+        <ZedAuthModal
+          isOpen={showOAuthModal}
+          providerInfo={providerInfo}
           onSuccess={handleOAuthSuccess}
           onClose={() => setShowOAuthModal(false)}
         />
@@ -1904,8 +2366,10 @@ export default function ProviderDetailPage() {
           isOpen={showAddCustomModel}
           providerAlias={providerStorageAlias}
           providerDisplayAlias={providerDisplayAlias}
-          onSave={async (modelId, caps) => {
-            await handleAddCustomModel(modelId, "llm", providerStorageAlias, caps);
+          onSave={async (modelId, caps, transport) => {
+            // caps.stt is a UI-only flag; the API accepts transports only on
+            // type "stt" records, so the save derives the type from it.
+            await handleAddCustomModel(modelId, caps?.stt ? "stt" : "llm", providerStorageAlias, caps, transport);
             setShowAddCustomModel(false);
           }}
           onClose={() => setShowAddCustomModel(false)}

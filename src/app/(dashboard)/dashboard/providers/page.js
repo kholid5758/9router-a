@@ -72,11 +72,14 @@ function getConnectionErrorTag(connection) {
   if (Number.isFinite(numericCode) && numericCode >= 400)
     return String(numericCode);
 
-  const fromMessage = getErrorCode(connection.lastError);
+  const rawLastError = typeof connection.lastError === "object"
+    ? connection.lastError?.message || JSON.stringify(connection.lastError)
+    : String(connection.lastError || "");
+  const fromMessage = getErrorCode(rawLastError);
   if (fromMessage === "401" || fromMessage === "403") return "AUTH";
   if (fromMessage && fromMessage !== "ERR") return fromMessage;
 
-  const msg = (connection.lastError || "").toLowerCase();
+  const msg = rawLastError.toLowerCase();
   if (
     msg.includes("runtime") ||
     msg.includes("not runnable") ||

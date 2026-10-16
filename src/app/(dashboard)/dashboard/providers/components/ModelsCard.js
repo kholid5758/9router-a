@@ -108,7 +108,7 @@ AddCustomModelModal.propTypes = {
 // ── ModelsCard ─────────────────────────────────────────────────
 // Self-contained card: shows models for a provider, filtered by optional `kindFilter`.
 // kindFilter: if provided, only shows models with matching type/kinds field.
-export default function ModelsCard({ providerId, kindFilter, providerAliasOverride }) {
+export default function ModelsCard({ providerId, kindFilter, providerAliasOverride, isCustomNode = false }) {
   const { copied, copy } = useCopyToClipboard();
   const [modelAliases, setModelAliases] = useState({});
   const [customModels, setCustomModels] = useState([]);
@@ -116,6 +116,9 @@ export default function ModelsCard({ providerId, kindFilter, providerAliasOverri
   const [testingModelId, setTestingModelId] = useState(null);
   const [testError, setTestError] = useState("");
   const [showAddCustomModel, setShowAddCustomModel] = useState(false);
+  const [autoRegisterRunning, setAutoRegisterRunning] = useState(false);
+  const [autoRegisterResult, setAutoRegisterResult] = useState(null);
+  const [testAllRunning, setTestAllRunning] = useState(false);
 
   const providerAlias = providerAliasOverride || getProviderAlias(providerId);
   const effectiveType = kindFilter || "llm";
@@ -133,7 +136,14 @@ export default function ModelsCard({ providerId, kindFilter, providerAliasOverri
     } catch (e) { console.log("ModelsCard fetch error:", e); }
   }, []);
 
-  useEffect(() => { fetchData(); }, [fetchData]);
+  // Load on mount. `fetchData` is a stable useCallback, so this effect runs
+  // exactly once; the call is deferred into a microtask callback so no
+  // setState runs synchronously in the effect body (react-hooks/set-state-in-
+  // effect). The initial render already shows the empty/loading state, so the
+  // one-microtask delay is invisible.
+  useEffect(() => {
+    queueMicrotask(fetchData);
+  }, [fetchData]);
 
   const handleSetAlias = async (modelId, alias) => {
     const fullModel = `${providerAlias}/${modelId}`;
@@ -179,6 +189,34 @@ export default function ModelsCard({ providerId, kindFilter, providerAliasOverri
     } catch (e) { console.log("delete custom model error:", e); }
   };
 
+  // Auto-register: scan the node's upstream /models, infer each model's media
+  // kind, ping the matching /v1 endpoint, and register only the models that
+  // pass. The ping gate is mandatory — a model that 404s upstream is skipped
+  // so the media tab never lists a broken model.
+  const handleAutoRegister = async () => {
+    setAutoRegisterRunning(true);
+    setAutoRegisterResult(null);
+    try {
+      const res = await fetch(`/api/provider-nodes/${providerId}/auto-register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ test: true, kind: kindFilter || undefined }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setAutoRegisterResult(data);
+        await fetchData();
+        window.dispatchEvent(new CustomEvent("customModelChanged"));
+      } else {
+        setAutoRegisterResult({ ok: false, error: data.error || "Auto-register failed" });
+      }
+    } catch (e) {
+      setAutoRegisterResult({ ok: false, error: e.message });
+    } finally {
+      setAutoRegisterRunning(false);
+    }
+  };
+
   const handleTestModel = async (modelId) => {
     if (testingModelId) return;
     setTestingModelId(modelId);
@@ -196,6 +234,7 @@ export default function ModelsCard({ providerId, kindFilter, providerAliasOverri
       setTestError("Network error");
     } finally { setTestingModelId(null); }
   };
+
 
   // Built-in models — filter by kindFilter if provided
   const allBuiltIn = getModelsByProviderId(providerId);
@@ -215,11 +254,59 @@ export default function ModelsCard({ providerId, kindFilter, providerAliasOverri
 
   const displayModels = builtInModels;
 
+  const handleTestAll = async () => {
+    const all = [...displayModels.map((m) => m.id), ...myCustomModels.map((m) => m.id)];
+    if (!all.length || testAllRunning) return;
+    setTestAllRunning(true);
+    setTestingModelId(null);
+    setTestError("");
+    const results = {};
+    await Promise.all(all.map(async (modelId) => {
+      try {
+        const res = await fetch("/api/models/test", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: `${providerAlias}/${modelId}`, kind: kindFilter }),
+        });
+        const data = await res.json();
+        results[modelId] = data.ok ? "ok" : "error";
+      } catch {
+        results[modelId] = "error";
+      }
+    }));
+    setModelTestResults((prev) => ({ ...prev, ...results }));
+    setTestAllRunning(false);
+  };
+
   return (
     <>
       <Card>
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold">Models{kindFilter ? ` — ${kindFilter.toUpperCase()}` : ""}</h2>
+          <div className="flex items-center gap-2">
+            {(displayModels.length > 0 || myCustomModels.length > 0) && (
+              <button
+                onClick={handleTestAll}
+                disabled={testAllRunning}
+                className="inline-flex items-center gap-1.5 h-7 px-3 text-xs font-semibold rounded-[8px] bg-surface-2 hover:bg-surface-3 text-text-main border border-border transition-colors disabled:opacity-50"
+              >
+                <span className="material-symbols-outlined text-[18px]" style={testAllRunning ? { animation: "spin 1s linear infinite" } : undefined}>
+                  {testAllRunning ? "progress_activity" : "play_circle"}
+                </span>
+                {testAllRunning ? "Testing…" : "Test All"}
+              </button>
+            )}
+            {isCustomNode && (
+              <button
+                onClick={handleAutoRegister}
+                disabled={autoRegisterRunning}
+                className="inline-flex items-center gap-1.5 h-7 px-3 text-xs font-semibold rounded-[8px] bg-brand-500 hover:bg-brand-600 text-white border border-transparent transition-colors disabled:opacity-50"
+              >
+                <span className="material-symbols-outlined text-[18px]">download</span>
+                {autoRegisterRunning ? "Importing…" : "Import from /models"}
+              </button>
+            )}
+          </div>
         </div>
         {testError && <p className="text-xs text-red-500 mb-3 break-words">{testError}</p>}
 
@@ -268,7 +355,37 @@ export default function ModelsCard({ providerId, kindFilter, providerAliasOverri
             <span className="material-symbols-outlined text-sm">add</span>
             Add Model
           </button>
+
         </div>
+
+        {isCustomNode && (autoRegisterRunning || autoRegisterResult) && (
+          <div className="mt-4 rounded-lg border border-border bg-surface-2/50 p-3">
+            <p className="mb-2 text-xs text-text-muted">
+              {autoRegisterRunning ? "Scanning upstream & testing models…" :
+                autoRegisterResult.error ? "Import failed" :
+                `Scanned ${autoRegisterResult.scanned} model(s), registered ${autoRegisterResult.registered}.`}
+            </p>
+            {!autoRegisterRunning && !autoRegisterResult.error && autoRegisterResult.results?.length > 0 && (
+              <ul className="flex flex-col gap-1">
+                {autoRegisterResult.results.map((r) => (
+                  <li key={r.model} className="flex items-center gap-2 text-xs">
+                    <span className={`material-symbols-outlined text-sm ${r.status === "added" ? "text-green-500" : r.status === "registered" ? "text-text-muted" : "text-amber-500"}`}>
+                      {r.status === "added" ? "check_circle" : r.status === "registered" ? "task_alt" : "warning"}
+                    </span>
+                    <code className="font-mono">{r.model}</code>
+                    <span className="text-text-muted">{r.kind}</span>
+                    <span className="ml-auto text-text-muted">
+                      {r.status === "skipped-test" ? "test failed" : r.status === "added" ? "registered" : "already present"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {!autoRegisterRunning && autoRegisterResult.error && (
+              <p className="text-xs text-red-500">{autoRegisterResult.error}</p>
+            )}
+          </div>
+        )}
       </Card>
 
       <AddCustomModelModal
@@ -279,6 +396,7 @@ export default function ModelsCard({ providerId, kindFilter, providerAliasOverri
         }}
         onClose={() => setShowAddCustomModel(false)}
       />
+
     </>
   );
 }
@@ -287,4 +405,5 @@ ModelsCard.propTypes = {
   providerId: PropTypes.string.isRequired,
   kindFilter: PropTypes.string, // e.g. "tts", "embedding" — filters models shown
   providerAliasOverride: PropTypes.string, // override alias (e.g. for custom-embedding nodes using prefix)
+  isCustomNode: PropTypes.bool, // enables the auto-register media models button
 };

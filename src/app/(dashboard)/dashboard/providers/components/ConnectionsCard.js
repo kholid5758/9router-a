@@ -120,7 +120,7 @@ function ConnectionRow({ connection, proxyPools, isOAuth, isFirst, isLast, onMov
             {hasAnyProxy && <Badge variant={proxyBadgeVariant} size="sm">Proxy</Badge>}
             {isCooldown && connection.isActive !== false && <CooldownTimer until={modelLockUntil} />}
             {connection.lastError && connection.isActive !== false && (
-              <span className="text-xs text-red-500 truncate max-w-[300px]" title={connection.lastError}>{connection.lastError}</span>
+              <span className="text-xs text-red-500 truncate max-w-[300px]" title={formatLastError(connection.lastError)}>{formatLastError(connection.lastError)}</span>
             )}
             <span className="text-xs text-text-muted">#{connection.priority}</span>
           </div>
@@ -295,6 +295,15 @@ AddApiKeyModal.propTypes = {
 
 // ── ConnectionsCard ────────────────────────────────────────────
 // Self-contained card: fetches, displays and manages all connections for a provider.
+function formatLastError(err) {
+  if (!err) return "";
+  if (typeof err === "string") return err;
+  if (typeof err === "object") {
+    return err.message || err.error || JSON.stringify(err);
+  }
+  return String(err);
+}
+
 export default function ConnectionsCard({ providerId, isOAuth }) {
   const [connections, setConnections] = useState([]);
   const [proxyPools, setProxyPools] = useState([]);
@@ -325,7 +334,9 @@ export default function ConnectionsCard({ providerId, isOAuth }) {
     finally { setLoading(false); }
   }, [providerId]);
 
-  useEffect(() => { fetch_(); }, [fetch_]);
+  useEffect(() => {
+    queueMicrotask(() => fetch_());
+  }, [fetch_]);
 
   const saveStrategy = async (strategy, stickyLimit) => {
     try {
